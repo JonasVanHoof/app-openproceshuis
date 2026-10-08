@@ -29,6 +29,9 @@ jobs:
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+      - name: Debug client key
+        run: |
+          ssh-keygen -y -f ~/.ssh/id_ed25519 || echo "private key unreadable / wrong format"
 
       - name: Inspect server repo (read-only)
         id: inspect
