@@ -195,20 +195,19 @@ jobs:
           docker compose ps frontend
           SCRIPT
 
-  # ===========================================================================
-  # Migrations preflight: only when there are new commits
-  # Image new or not: both OK, it's informational.
-  # ===========================================================================
   migrations-preflight:
     name: Migrations preflight
     needs: server-preflight
-    if: needs.server-preflight.outputs.new_commits == 'true'
     runs-on: ubuntu-latest
+    env:
+      SVC: migrations
+      WATCH: config/migrations
+      DEPLOY_ON: added        # only new migration files trigger a deploy
     outputs:
-      new_migrations: ${{ steps.check.outputs.new_migrations }}
+      deploy_needed: ${{ steps.check.outputs.deploy_needed }}
     steps:
       - name: Checkout possible?
-        if: needs.server-preflight.outputs.checkout_possible != 'true'
+        if: needs.server-preflight.outputs.new_commits == 'true' && needs.server-preflight.outputs.checkout_possible != 'true'
         run: |
           echo "::error title=Manual intervention needed::Cannot switch to $BRANCH on the server. See server preflight summary."
           exit 1
@@ -220,109 +219,163 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-      - name: Check image, config and new migrations
+      - name: Check image, config and watched files
         id: check
-        run: |
-          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT' | tee migrations.txt
+        run: &service_preflight |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" "$SVC" "$WATCH" "$DEPLOY_ON" <<'SCRIPT' | tee "$SVC.txt"
           set -e
           cd "$1"
-          BRANCH=$2
-          SVC=migrations
+          BRANCH=$2; SVC=$3; WATCH=$4; DEPLOY_ON=$5
+          GITDIR=$(git rev-parse --git-dir)
+          MARKER="$GITDIR/deployed/$SVC"
+          TARGET="origin/$BRANCH"
           TMP=$(mktemp -d)
           trap 'rm -rf "$TMP"' EXIT
 
+          if [ -f "$MARKER" ]; then
+            BASE=$(cat "$MARKER")
+            echo "base: last $SVC deploy at $(git log -1 --format='%h %s' "$BASE")"
+          else
+            BASE=$(git rev-parse HEAD)
+            echo "base: current checkout $(git log -1 --format='%h %s' "$BASE") (no $SVC deploy recorded yet)"
+          fi
+          echo "target: $TARGET at $(git log -1 --format='%h %s' "$TARGET")"
+
           # --- compose files as they will be after the pull ---
-          # tracked files: version from origin/$BRANCH, untracked (e.g. local override): as on disk
+          # tracked: version from $TARGET, untracked (e.g. local override): as on disk
           CF=$(grep -E '^COMPOSE_FILE=' .env 2>/dev/null | cut -d= -f2- || true)
           [ -z "$CF" ] && CF="docker-compose.yml:docker-compose.override.yml"
           files=()
           IFS=: read -ra list <<< "$CF"
           for f in "${list[@]}"; do
-            if git cat-file -e "origin/$BRANCH:$f" 2>/dev/null; then
+            if git cat-file -e "$TARGET:$f" 2>/dev/null; then
               mkdir -p "$TMP/$(dirname "$f")"
-              git show "origin/$BRANCH:$f" > "$TMP/$f"
+              git show "$TARGET:$f" > "$TMP/$f"
               files+=(-f "$TMP/$f")
             elif [ -f "$f" ]; then
               files+=(-f "$PWD/$f")
             fi
           done
-
-          CID=$(docker compose ps -a -q "$SVC")
           PROJECT=$(docker compose config --format json 2>/dev/null | grep -oE '"name": *"[^"]+"' | head -1 | cut -d'"' -f4)
           # project dir = app dir, so .env and relative volume paths resolve as usual
           NEXT=(docker compose --project-directory "$PWD" ${PROJECT:+-p "$PROJECT"} "${files[@]}")
+          CID=$(docker compose ps -a -q "$SVC")
 
           # --- 1. image tag ---
+          image_new=false
           IMAGE_NOW=$(docker compose config --images "$SVC")
           IMAGE_NEXT=$("${NEXT[@]}" config --images "$SVC")
           "${NEXT[@]}" pull --quiet "$SVC"   # downloads only, container untouched
+          echo
           echo "== image =="
           if [ "$IMAGE_NOW" != "$IMAGE_NEXT" ]; then
+            image_new=true
             echo "tag changes: $IMAGE_NOW -> $IMAGE_NEXT"
           elif [ -n "$CID" ] && [ "$(docker image inspect -f '{{.Id}}' "$IMAGE_NEXT")" = "$(docker inspect -f '{{.Image}}' "$CID")" ]; then
             echo "$IMAGE_NEXT: no new version"
           else
+            image_new=true
             echo "$IMAGE_NEXT: new version available"
           fi
 
           # --- 2. service config ---
+          config_changed=false
           echo
           echo "== config =="
           if [ -z "$CID" ]; then
+            config_changed=true
             echo "no $SVC container yet"
           elif [ "$("${NEXT[@]}" config --hash "$SVC" | awk '{print $2}')" \
                != "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$CID")" ]; then
+            config_changed=true
             echo "$SVC service config changes"
           else
             echo "no config changes for $SVC"
           fi
 
-          # --- 3. migrations ---
+          # --- 3. watched files ---
           echo
-          echo "== migrations =="
-          added=$(git diff --name-only --diff-filter=A HEAD "origin/$BRANCH" -- config/migrations)
+          echo "== $WATCH =="
+          added=$(git diff --name-only --diff-filter=A "$BASE" "$TARGET" -- "$WATCH")
+          changed=$(git diff --name-status --diff-filter=MDR "$BASE" "$TARGET" -- "$WATCH")
           if [ -n "$added" ]; then
-            echo "new_migrations=true"
-            echo "new migrations ($(echo "$added" | wc -l)):"
+            echo "new files ($(echo "$added" | wc -l)):"
             echo "$added" | sed 's/^/  + /'
           else
-            echo "new_migrations=false"
-            echo "no new migrations"
+            echo "no new files"
+          fi
+          if [ -n "$changed" ]; then
+            echo "changed/removed files:"
+            echo "$changed" | sed 's/^/  ~ /'
           fi
 
-          changed=$(git diff --name-status --diff-filter=MDR HEAD "origin/$BRANCH" -- config/migrations)
-          if [ -n "$changed" ]; then
-            echo
-            echo "WARNING: existing migrations changed/removed (already-run migrations are NOT re-run):"
-            echo "$changed" | sed 's/^/  ! /'
-          fi
+          # --- decision ---
+          deploy=false
+          case "$DEPLOY_ON" in
+            added) [ -n "$added" ] && deploy=true ;;
+            any)   { [ -n "$added$changed" ] || [ "$image_new" = true ] || [ "$config_changed" = true ]; } && deploy=true ;;
+          esac
+          echo
+          echo "deploy_needed=$deploy"
+          [ "$DEPLOY_ON" = added ] && [ -n "$changed" ] && echo "warning=existing files changed/removed; already-run migrations are NOT re-run"
+          true
           SCRIPT
-          grep '^new_migrations=' migrations.txt >> "$GITHUB_OUTPUT"
+          grep '^deploy_needed=' "$SVC.txt" >> "$GITHUB_OUTPUT"
           {
-            echo "### Migrations preflight"
+            echo "### ${SVC^} preflight"
             echo '```'
-            grep -v '^new_migrations=' migrations.txt
+            grep -vE '^(deploy_needed|warning)=' "$SVC.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if grep -q '^new_migrations=false' migrations.txt; then
-            echo "::notice title=No new migrations::Migrations deploy is skipped."
+          if grep -q '^warning=' "$SVC.txt"; then
+            echo "::warning title=$SVC::$(grep '^warning=' "$SVC.txt" | cut -d= -f2-)"
           fi
-          if grep -q '^WARNING: existing migrations' migrations.txt; then
-            echo "::warning title=Existing migrations changed::Already-run migrations were edited or removed. See summary."
+          if grep -q '^deploy_needed=false' "$SVC.txt"; then
+            echo "::notice title=$SVC::Nothing to deploy."
           fi
 
+  resources-preflight:
+    name: Resources preflight
+    needs: server-preflight
+    runs-on: ubuntu-latest
+    env:
+      SVC: resources
+      WATCH: config/resources
+      DEPLOY_ON: any          # resource config change, new image or compose change
+    outputs:
+      deploy_needed: ${{ steps.check.outputs.deploy_needed }}
+    steps:
+      - name: Checkout possible?
+        if: needs.server-preflight.outputs.new_commits == 'true' && needs.server-preflight.outputs.checkout_possible != 'true'
+        run: |
+          echo "::error title=Manual intervention needed::Cannot switch to $BRANCH on the server. See server preflight summary."
+          exit 1
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Check image, config and watched files
+        id: check
+        run: *service_preflight
+
   # ===========================================================================
-  # Migrations deploy: MANUAL — pull repo, stop + start migrations
+  # Service deploys: MANUAL — pull repo, stop + start the service
   # ===========================================================================
   migrations-deploy:
     name: Migrations deploy
     needs: migrations-preflight
-    if: needs.migrations-preflight.outputs.new_migrations == 'true'
+    if: needs.migrations-preflight.outputs.deploy_needed == 'true'
     environment: dev-approve-deploy
     concurrency:
       group: deploy-migrations-dev
       cancel-in-progress: false
     runs-on: ubuntu-latest
+    env:
+      SVC: migrations
     steps:
       - name: Set up SSH
         run: |
@@ -331,19 +384,97 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-      - name: Checkout, pull and recreate migrations
-        run: |
-          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT'
+      - name: Pull repo and recreate service
+        run: &service_deploy |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" "$SVC" <<'SCRIPT'
           set -e
           cd "$1"
-          BRANCH=$2
-          git fetch --quiet origin "$BRANCH"
-          git checkout "$BRANCH"
-          git pull --ff-only origin "$BRANCH"
-          echo "now at: $(git log -1 --oneline --no-decorate)"
-          # again, in case the new commits changed the migrations tag
-          docker compose pull --quiet migrations
-          # new image and/or new mounted migration files -> force a fresh start
-          docker compose up -d --no-deps --force-recreate migrations
-          docker compose ps migrations
+          BRANCH=$2; SVC=$3
+          GITDIR=$(git rev-parse --git-dir)
+          # git under a server-side lock: migrations and resources deploys can run at the same time
+          flock "$GITDIR/deploy.lock" bash -c '
+            set -e
+            git fetch --quiet origin "$1"
+            git checkout --quiet "$1"
+            git pull --quiet --ff-only origin "$1"
+          ' _ "$BRANCH"
+          echo "repo at: $(git log -1 --oneline --no-decorate)"
+          docker compose pull --quiet "$SVC"
+          # new image and/or new mounted files -> force a fresh start
+          docker compose up -d --no-deps --force-recreate "$SVC"
+          mkdir -p "$GITDIR/deployed"
+          git rev-parse HEAD > "$GITDIR/deployed/$SVC"
+          docker compose ps "$SVC"
           SCRIPT
+
+  resources-deploy:
+    name: Resources deploy
+    needs: resources-preflight
+    if: needs.resources-preflight.outputs.deploy_needed == 'true'
+    environment: dev-approve-deploy
+    concurrency:
+      group: deploy-resources-dev
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      SVC: resources
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Pull repo and recreate service
+        run: *service_deploy
+
+  # ===========================================================================
+  # Restart cache: AUTOMATIC right after each successful migrations/resources deploy
+  # One job per deploy, so the cache never waits on an approval of the other service.
+  # ===========================================================================
+  restart-cache-after-migrations:
+    name: Restart cache (after migrations)
+    needs: migrations-deploy
+    concurrency:
+      group: deploy-cache-dev
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      SVC: cache
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Restart cache
+        run: &restart_cache |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$SVC" <<'SCRIPT'
+          set -e
+          cd "$1"
+          docker compose restart "$2"
+          docker compose ps "$2"
+          SCRIPT
+
+  restart-cache-after-resources:
+    name: Restart cache (after resources)
+    needs: resources-deploy
+    concurrency:
+      group: deploy-cache-dev
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    env:
+      SVC: cache
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Restart cache
+        run: *restart_cache
