@@ -195,6 +195,14 @@ jobs:
           docker compose ps frontend
           SCRIPT
 
+  # ===========================================================================
+  # Service preflights for repo-driven services (migrations, resources)
+  #
+  # Compares origin/$BRANCH with the commit this service was LAST DEPLOYED at
+  # (.git/deployed/<service>), not with HEAD: a resources deploy pulls the repo,
+  # and pending migrations must still be detected afterwards.
+  # Read-only: only pulls images and writes temp files in /tmp.
+  # ===========================================================================
   migrations-preflight:
     name: Migrations preflight
     needs: server-preflight
@@ -202,7 +210,7 @@ jobs:
     env:
       SVC: migrations
       WATCH: config/migrations
-      DEPLOY_ON: added        # only new migration files trigger a deploy
+      DEPLOY_ON: added # only new migration files trigger a deploy
     outputs:
       deploy_needed: ${{ steps.check.outputs.deploy_needed }}
     steps:
@@ -339,9 +347,9 @@ jobs:
     needs: server-preflight
     runs-on: ubuntu-latest
     env:
-      SVC: resources
+      SVC: resource # compose service name (folder is config/resources)
       WATCH: config/resources
-      DEPLOY_ON: any          # resource config change, new image or compose change
+      DEPLOY_ON: any # resource config change, new image or compose change
     outputs:
       deploy_needed: ${{ steps.check.outputs.deploy_needed }}
     steps:
@@ -417,7 +425,7 @@ jobs:
       cancel-in-progress: false
     runs-on: ubuntu-latest
     env:
-      SVC: resources
+      SVC: resource
     steps:
       - name: Set up SSH
         run: |
