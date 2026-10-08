@@ -10,6 +10,7 @@ env:
   USER: ${{ secrets.DEPLOY_USER }}
   APP_DIR: ${{ vars.APP_DIR }}
   BRANCH: deploy-workflow
+  BASE_SERVICES: virtuoso database
 
 defaults:
   run:
@@ -106,12 +107,61 @@ jobs:
             echo "::warning title=Server repo not clean::Checkout of $BRANCH not possible. See summary."
           fi
 
+  base-services:
+    name: Base services
+    needs: server-preflight
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Check base services
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BASE_SERVICES" <<'SCRIPT' | tee base.txt
+          cd "$1"
+          read -ra BASE <<< "$2"
+          down=0
+          printf '%-20s %-10s %-10s %s\n' SERVICE STATE HEALTH STATUS
+          for svc in "${BASE[@]}"; do
+            CID=$(docker compose ps -a -q "$svc" 2>/dev/null | head -1)
+            if [ -z "$CID" ]; then
+              printf '%-20s %-10s %-10s %s\n' "$svc" missing - "no container"
+              down=1
+              continue
+            fi
+            STATE=$(docker inspect -f '{{.State.Status}}' "$CID")
+            HEALTH=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$CID")
+            STATUS=$(docker ps -a --filter "id=$CID" --format '{{.Status}}')
+            printf '%-20s %-10s %-10s %s\n' "$svc" "$STATE" "$HEALTH" "$STATUS"
+            # running, and healthy if the service has a healthcheck
+            if [ "$STATE" != running ] || { [ "$HEALTH" != - ] && [ "$HEALTH" != healthy ]; }; then
+              down=1
+            fi
+          done
+          echo
+          echo "base_ok=$([ $down -eq 0 ] && echo true || echo false)"
+          SCRIPT
+          {
+            echo "### Base services"
+            echo '```'
+            grep -v '^base_ok=' base.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if ! grep -q '^base_ok=true' base.txt; then
+            echo "::error title=Base services not up::One or more base services are not running/healthy. See summary."
+            exit 1
+          fi
+
   # ===========================================================================
   # Frontend preflight: always (frontend runs on :latest)
   # ===========================================================================
   frontend-preflight:
     name: Frontend preflight
-    needs: server-preflight
+    needs: [server-preflight, base-services]
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
@@ -195,17 +245,9 @@ jobs:
           docker compose ps frontend
           SCRIPT
 
-  # ===========================================================================
-  # Service preflights for repo-driven services (migrations, resources)
-  #
-  # Compares origin/$BRANCH with the commit this service was LAST DEPLOYED at
-  # (.git/deployed/<service>), not with HEAD: a resources deploy pulls the repo,
-  # and pending migrations must still be detected afterwards.
-  # Read-only: only pulls images and writes temp files in /tmp.
-  # ===========================================================================
   migrations-preflight:
     name: Migrations preflight
-    needs: server-preflight
+    needs: [server-preflight, base-services]
     runs-on: ubuntu-latest
     env:
       SVC: migrations
@@ -244,8 +286,12 @@ jobs:
             BASE=$(cat "$MARKER")
             echo "base: last $SVC deploy at $(git log -1 --format='%h %s' "$BASE")"
           else
+            # first run: record the current checkout as deployed state NOW, before any
+            # other service's deploy pulls the repo and moves HEAD past these changes
             BASE=$(git rev-parse HEAD)
-            echo "base: current checkout $(git log -1 --format='%h %s' "$BASE") (no $SVC deploy recorded yet)"
+            mkdir -p "$GITDIR/deployed"
+            echo "$BASE" > "$MARKER"
+            echo "base: current checkout $(git log -1 --format='%h %s' "$BASE") (no $SVC deploy recorded yet, marker created)"
           fi
           echo "target: $TARGET at $(git log -1 --format='%h %s' "$TARGET")"
 
@@ -344,7 +390,7 @@ jobs:
 
   resources-preflight:
     name: Resources preflight
-    needs: server-preflight
+    needs: [server-preflight, base-services]
     runs-on: ubuntu-latest
     env:
       SVC: resource # compose service name (folder is config/resources)
