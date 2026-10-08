@@ -1,0 +1,346 @@
+name: Deploy (development)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [deploy-workflow]
+
+env:
+  HOST: ${{ secrets.DEPLOY_HOST }}
+  USER: ${{ secrets.DEPLOY_USER }}
+  APP_DIR: ${{ vars.APP_DIR }}
+  BRANCH: development
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ===========================================================================
+  # Server preflight: current branch, checkout possible, new commits
+  # Read-only: changes nothing on the server.
+  # ===========================================================================
+  server-preflight:
+    name: Server preflight
+    runs-on: ubuntu-latest
+    outputs:
+      current_branch: ${{ steps.inspect.outputs.current_branch }}
+      checkout_possible: ${{ steps.inspect.outputs.checkout_possible }}
+      new_commits: ${{ steps.inspect.outputs.new_commits }}
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Inspect server repo
+        id: inspect
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT' | tee preflight.txt
+          set -e
+          cd "$1"
+          git fetch --quiet origin "$2"
+          GITDIR=$(git rev-parse --git-dir)
+          CURRENT=$(git rev-parse --abbrev-ref HEAD)
+          echo "current_branch=$CURRENT"
+
+          # --- new commits? ---
+          if [ "$CURRENT" != "$2" ]; then
+            echo "new_commits=true"
+            echo "info=server is on '$CURRENT', will switch to '$2'"
+          elif [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$2")" ]; then
+            echo "new_commits=true"
+            echo "info=new commits ($(git rev-list --count "HEAD..origin/$2")):"
+            git log --oneline --no-decorate "HEAD..origin/$2" | sed 's/^/info=  /'
+          else
+            echo "new_commits=false"
+            echo "info=already at origin/$2: $(git log -1 --oneline --no-decorate)"
+          fi
+
+          # --- can we check out? ---
+          blockers=()
+          [ -f "$GITDIR/MERGE_HEAD" ] && blockers+=("merge in progress")
+          [ -f "$GITDIR/CHERRY_PICK_HEAD" ] && blockers+=("cherry-pick in progress")
+          { [ -d "$GITDIR/rebase-merge" ] || [ -d "$GITDIR/rebase-apply" ]; } && blockers+=("rebase in progress")
+
+          while read -r line; do
+            [ -n "$line" ] && blockers+=("uncommitted change: $line")
+          done < <(git status --porcelain --untracked-files=no)
+
+          # untracked files that exist in origin/$2 would be overwritten by checkout
+          while read -r f; do
+            [ -n "$f" ] && git cat-file -e "origin/$2:$f" 2>/dev/null \
+              && blockers+=("untracked file would be overwritten: $f")
+          done < <(git ls-files --others --exclude-standard)
+
+          # local $2 must be able to fast-forward to origin/$2
+          if git rev-parse --verify --quiet "refs/heads/$2" >/dev/null \
+             && ! git merge-base --is-ancestor "$2" "origin/$2"; then
+            blockers+=("local $2 has commits not on origin:")
+            while read -r c; do blockers+=("  $c"); done \
+              < <(git log --oneline --no-decorate "origin/$2..$2")
+          fi
+
+          if [ ${#blockers[@]} -eq 0 ]; then
+            echo "checkout_possible=true"
+          else
+            echo "checkout_possible=false"
+            printf 'blocker=%s\n' "${blockers[@]}"
+          fi
+          SCRIPT
+          grep -E '^(current_branch|checkout_possible|new_commits)=' preflight.txt >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        run: |
+          {
+            echo "### Server preflight (development)"
+            echo '```'
+            sed -e 's/^blocker=/blocker: /' -e 's/^info=//' preflight.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # not fatal here: frontend doesn't need git. migrations-preflight fails on it.
+          if grep -q '^checkout_possible=false' preflight.txt; then
+            echo "::warning title=Server repo not clean::Checkout of $BRANCH not possible. See summary."
+          fi
+
+  # ===========================================================================
+  # Frontend preflight: always (frontend runs on :latest)
+  # ===========================================================================
+  frontend-preflight:
+    name: Frontend preflight
+    needs: server-preflight
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Pull image and compare with running container
+        id: compare
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" <<'SCRIPT' | tee frontend.txt
+          set -e
+          cd "$1"
+          # downloads only, the running container is not touched
+          docker compose pull --quiet frontend
+
+          IMAGE=$(docker compose config --images frontend)
+          WANT_IMG=$(docker image inspect -f '{{.Id}}' "$IMAGE")
+          CID=$(docker compose ps -a -q frontend)
+          echo "image=$IMAGE"
+
+          if [ -z "$CID" ]; then
+            echo "changed=true"
+            echo "reason=no frontend container yet"
+          elif [ "$WANT_IMG" != "$(docker inspect -f '{{.Image}}' "$CID")" ]; then
+            echo "changed=true"
+            echo "reason=new image available for $IMAGE"
+          elif [ "$(docker compose config --hash frontend | awk '{print $2}')" \
+               != "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$CID")" ]; then
+            echo "changed=true"
+            echo "reason=frontend config changed in docker-compose"
+          else
+            echo "changed=false"
+          fi
+          SCRIPT
+          grep '^changed=' frontend.txt >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        run: |
+          {
+            echo "### Frontend preflight"
+            echo '```'
+            cat frontend.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q '^changed=false' frontend.txt; then
+            echo "::notice title=Frontend up to date::Running container already uses the latest image."
+          fi
+
+  # ===========================================================================
+  # Frontend deploy: MANUAL — stop + start with the new image
+  # ===========================================================================
+  frontend-deploy:
+    name: Frontend deploy
+    needs: frontend-preflight
+    if: needs.frontend-preflight.outputs.changed == 'true'
+    environment: dev-approve-deploy
+    concurrency:
+      group: deploy-frontend-dev
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Recreate frontend
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" <<'SCRIPT'
+          set -e
+          cd "$1"
+          # image was pulled in the preflight: deploys exactly what was checked
+          docker compose up -d --no-deps frontend
+          docker compose ps frontend
+          SCRIPT
+
+  # ===========================================================================
+  # Migrations preflight: only when there are new commits
+  # Image new or not: both OK, it's informational.
+  # ===========================================================================
+  migrations-preflight:
+    name: Migrations preflight
+    needs: server-preflight
+    if: needs.server-preflight.outputs.new_commits == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      new_migrations: ${{ steps.check.outputs.new_migrations }}
+    steps:
+      - name: Checkout possible?
+        if: needs.server-preflight.outputs.checkout_possible != 'true'
+        run: |
+          echo "::error title=Manual intervention needed::Cannot switch to $BRANCH on the server. See server preflight summary."
+          exit 1
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Check image, config and new migrations
+        id: check
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT' | tee migrations.txt
+          set -e
+          cd "$1"
+          SVC=migrations
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+
+          # --- compose files as they will be after the pull ---
+          # tracked files: version from origin/$2, untracked (e.g. local override): as on disk
+          CF=$(grep -E '^COMPOSE_FILE=' .env 2>/dev/null | cut -d= -f2- || true)
+          [ -z "$CF" ] && CF="docker-compose.yml:docker-compose.override.yml"
+          files=()
+          IFS=: read -ra list <<< "$CF"
+          for f in "${list[@]}"; do
+            if git cat-file -e "origin/$2:$f" 2>/dev/null; then
+              mkdir -p "$TMP/$(dirname "$f")"
+              git show "origin/$2:$f" > "$TMP/$f"
+              files+=(-f "$TMP/$f")
+            elif [ -f "$f" ]; then
+              files+=(-f "$PWD/$f")
+            fi
+          done
+
+          CID=$(docker compose ps -a -q "$SVC")
+          PROJECT=$(docker compose config --format json 2>/dev/null | grep -oE '"name": *"[^"]+"' | head -1 | cut -d'"' -f4)
+          # project dir = app dir, so .env and relative volume paths resolve as usual
+          NEXT=(docker compose --project-directory "$PWD" ${PROJECT:+-p "$PROJECT"} "${files[@]}")
+
+          # --- 1. image tag ---
+          IMAGE_NOW=$(docker compose config --images "$SVC")
+          IMAGE_NEXT=$("${NEXT[@]}" config --images "$SVC")
+          "${NEXT[@]}" pull --quiet "$SVC"   # downloads only, container untouched
+          echo "== image =="
+          if [ "$IMAGE_NOW" != "$IMAGE_NEXT" ]; then
+            echo "tag changes: $IMAGE_NOW -> $IMAGE_NEXT"
+          elif [ -n "$CID" ] && [ "$(docker image inspect -f '{{.Id}}' "$IMAGE_NEXT")" = "$(docker inspect -f '{{.Image}}' "$CID")" ]; then
+            echo "$IMAGE_NEXT: no new version"
+          else
+            echo "$IMAGE_NEXT: new version available"
+          fi
+
+          # --- 2. service config ---
+          echo
+          echo "== config =="
+          if [ -z "$CID" ]; then
+            echo "no $SVC container yet"
+          elif [ "$("${NEXT[@]}" config --hash "$SVC" | awk '{print $2}')" \
+               != "$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$CID")" ]; then
+            echo "$SVC service config changes"
+          else
+            echo "no config changes for $SVC"
+          fi
+
+          # --- 3. migrations ---
+          echo
+          echo "== migrations =="
+          added=$(git diff --name-only --diff-filter=A HEAD "origin/$2" -- config/migrations)
+          if [ -n "$added" ]; then
+            echo "new_migrations=true"
+            echo "new migrations ($(echo "$added" | wc -l)):"
+            echo "$added" | sed 's/^/  + /'
+          else
+            echo "new_migrations=false"
+            echo "no new migrations"
+          fi
+
+          changed=$(git diff --name-status --diff-filter=MDR HEAD "origin/$2" -- config/migrations)
+          if [ -n "$changed" ]; then
+            echo
+            echo "WARNING: existing migrations changed/removed (already-run migrations are NOT re-run):"
+            echo "$changed" | sed 's/^/  ! /'
+          fi
+          SCRIPT
+          grep '^new_migrations=' migrations.txt >> "$GITHUB_OUTPUT"
+          {
+            echo "### Migrations preflight"
+            echo '```'
+            grep -v '^new_migrations=' migrations.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q '^new_migrations=false' migrations.txt; then
+            echo "::notice title=No new migrations::Migrations deploy is skipped."
+          fi
+          if grep -q '^WARNING: existing migrations' migrations.txt; then
+            echo "::warning title=Existing migrations changed::Already-run migrations were edited or removed. See summary."
+          fi
+
+  # ===========================================================================
+  # Migrations deploy: MANUAL — pull repo, stop + start migrations
+  # ===========================================================================
+  migrations-deploy:
+    name: Migrations deploy
+    needs: migrations-preflight
+    if: needs.migrations-preflight.outputs.new_migrations == 'true'
+    environment: dev-approve-deploy
+    concurrency:
+      group: deploy-migrations-dev
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Checkout, pull and recreate migrations
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT'
+          set -e
+          cd "$1"
+          git fetch --quiet origin "$2"
+          git checkout "$2"
+          git pull --ff-only origin "$2"
+          echo "now at: $(git log -1 --oneline --no-decorate)"
+          # again, in case the new commits changed the migrations tag
+          docker compose pull --quiet migrations
+          # new image and/or new mounted migration files -> force a fresh start
+          docker compose up -d --no-deps --force-recreate migrations
+          docker compose ps migrations
+          SCRIPT
