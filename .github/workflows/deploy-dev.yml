@@ -1,4 +1,4 @@
-name: Deploy (development)
+name: Deploy
 
 on:
   workflow_dispatch:
@@ -41,22 +41,23 @@ jobs:
           ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT' | tee preflight.txt
           set -e
           cd "$1"
-          git fetch --quiet origin "$2"
+          BRANCH=$2
+          git fetch --quiet origin "$BRANCH"
           GITDIR=$(git rev-parse --git-dir)
           CURRENT=$(git rev-parse --abbrev-ref HEAD)
           echo "current_branch=$CURRENT"
 
           # --- new commits? ---
-          if [ "$CURRENT" != "$2" ]; then
+          if [ "$CURRENT" != "$BRANCH" ]; then
             echo "new_commits=true"
-            echo "info=server is on '$CURRENT', will switch to '$2'"
-          elif [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$2")" ]; then
+            echo "info=server is on '$CURRENT', will switch to '$BRANCH'"
+          elif [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then
             echo "new_commits=true"
-            echo "info=new commits ($(git rev-list --count "HEAD..origin/$2")):"
-            git log --oneline --no-decorate "HEAD..origin/$2" | sed 's/^/info=  /'
+            echo "info=new commits ($(git rev-list --count "HEAD..origin/$BRANCH")):"
+            git log --oneline --no-decorate "HEAD..origin/$BRANCH" | sed 's/^/info=  /'
           else
             echo "new_commits=false"
-            echo "info=already at origin/$2: $(git log -1 --oneline --no-decorate)"
+            echo "info=already at origin/$BRANCH: $(git log -1 --oneline --no-decorate)"
           fi
 
           # --- can we check out? ---
@@ -69,18 +70,18 @@ jobs:
             [ -n "$line" ] && blockers+=("uncommitted change: $line")
           done < <(git status --porcelain --untracked-files=no)
 
-          # untracked files that exist in origin/$2 would be overwritten by checkout
+          # untracked files that exist in origin/$BRANCH would be overwritten by checkout
           while read -r f; do
-            [ -n "$f" ] && git cat-file -e "origin/$2:$f" 2>/dev/null \
+            [ -n "$f" ] && git cat-file -e "origin/$BRANCH:$f" 2>/dev/null \
               && blockers+=("untracked file would be overwritten: $f")
           done < <(git ls-files --others --exclude-standard)
 
-          # local $2 must be able to fast-forward to origin/$2
-          if git rev-parse --verify --quiet "refs/heads/$2" >/dev/null \
-             && ! git merge-base --is-ancestor "$2" "origin/$2"; then
-            blockers+=("local $2 has commits not on origin:")
+          # local $BRANCH must be able to fast-forward to origin/$BRANCH
+          if git rev-parse --verify --quiet "refs/heads/$BRANCH" >/dev/null \
+             && ! git merge-base --is-ancestor "$BRANCH" "origin/$BRANCH"; then
+            blockers+=("local $BRANCH has commits not on origin:")
             while read -r c; do blockers+=("  $c"); done \
-              < <(git log --oneline --no-decorate "origin/$2..$2")
+              < <(git log --oneline --no-decorate "origin/$BRANCH..$BRANCH")
           fi
 
           if [ ${#blockers[@]} -eq 0 ]; then
@@ -95,7 +96,7 @@ jobs:
       - name: Report
         run: |
           {
-            echo "### Server preflight (development)"
+            echo "### Server preflight ($BRANCH)"
             echo '```'
             sed -e 's/^blocker=/blocker: /' -e 's/^info=//' preflight.txt
             echo '```'
@@ -225,20 +226,21 @@ jobs:
           ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT' | tee migrations.txt
           set -e
           cd "$1"
+          BRANCH=$2
           SVC=migrations
           TMP=$(mktemp -d)
           trap 'rm -rf "$TMP"' EXIT
 
           # --- compose files as they will be after the pull ---
-          # tracked files: version from origin/$2, untracked (e.g. local override): as on disk
+          # tracked files: version from origin/$BRANCH, untracked (e.g. local override): as on disk
           CF=$(grep -E '^COMPOSE_FILE=' .env 2>/dev/null | cut -d= -f2- || true)
           [ -z "$CF" ] && CF="docker-compose.yml:docker-compose.override.yml"
           files=()
           IFS=: read -ra list <<< "$CF"
           for f in "${list[@]}"; do
-            if git cat-file -e "origin/$2:$f" 2>/dev/null; then
+            if git cat-file -e "origin/$BRANCH:$f" 2>/dev/null; then
               mkdir -p "$TMP/$(dirname "$f")"
-              git show "origin/$2:$f" > "$TMP/$f"
+              git show "origin/$BRANCH:$f" > "$TMP/$f"
               files+=(-f "$TMP/$f")
             elif [ -f "$f" ]; then
               files+=(-f "$PWD/$f")
@@ -278,7 +280,7 @@ jobs:
           # --- 3. migrations ---
           echo
           echo "== migrations =="
-          added=$(git diff --name-only --diff-filter=A HEAD "origin/$2" -- config/migrations)
+          added=$(git diff --name-only --diff-filter=A HEAD "origin/$BRANCH" -- config/migrations)
           if [ -n "$added" ]; then
             echo "new_migrations=true"
             echo "new migrations ($(echo "$added" | wc -l)):"
@@ -288,7 +290,7 @@ jobs:
             echo "no new migrations"
           fi
 
-          changed=$(git diff --name-status --diff-filter=MDR HEAD "origin/$2" -- config/migrations)
+          changed=$(git diff --name-status --diff-filter=MDR HEAD "origin/$BRANCH" -- config/migrations)
           if [ -n "$changed" ]; then
             echo
             echo "WARNING: existing migrations changed/removed (already-run migrations are NOT re-run):"
@@ -334,9 +336,10 @@ jobs:
           ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" <<'SCRIPT'
           set -e
           cd "$1"
-          git fetch --quiet origin "$2"
-          git checkout "$2"
-          git pull --ff-only origin "$2"
+          BRANCH=$2
+          git fetch --quiet origin "$BRANCH"
+          git checkout "$BRANCH"
+          git pull --ff-only origin "$BRANCH"
           echo "now at: $(git log -1 --oneline --no-decorate)"
           # again, in case the new commits changed the migrations tag
           docker compose pull --quiet migrations
