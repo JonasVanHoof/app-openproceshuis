@@ -9,7 +9,7 @@ env:
   HOST: ${{ secrets.DEPLOY_HOST }}
   USER: ${{ secrets.DEPLOY_USER }}
   APP_DIR: ${{ vars.APP_DIR }}
-  BRANCH: development
+  BRANCH: deploy-workflow
 
 defaults:
   run:
