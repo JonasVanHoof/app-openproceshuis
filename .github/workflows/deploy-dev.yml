@@ -11,6 +11,7 @@ env:
   APP_DIR: ${{ vars.APP_DIR }}
   BRANCH: deploy-workflow
   BASE_SERVICES: virtuoso database
+  MARKER_SERVICES: migrations resource
 
 defaults:
   run:
@@ -107,6 +108,10 @@ jobs:
             echo "::warning title=Server repo not clean::Checkout of $BRANCH not possible. See summary."
           fi
 
+  # ===========================================================================
+  # Base services: pull the repo (only with new commits), then check that the
+  # base services are up. The ONLY job that touches git on the server.
+  # ===========================================================================
   base-services:
     name: Base services
     needs: server-preflight
@@ -118,6 +123,36 @@ jobs:
           echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Pull repo (only when there are new commits)
+        if: needs.server-preflight.outputs.new_commits == 'true' && needs.server-preflight.outputs.checkout_possible == 'true'
+        run: |
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" "$MARKER_SERVICES" <<'SCRIPT' | tee pull.txt
+          set -e
+          cd "$1"
+          BRANCH=$2; MARKER_SERVICES=$3
+          GITDIR=$(git rev-parse --git-dir)
+          # lock in case two workflow runs overlap
+          flock "$GITDIR/deploy.lock" bash -c '
+            set -e
+            GITDIR=$1; BRANCH=$2; shift 2
+            # seed missing markers at the OLD HEAD before moving it,
+            # so undeployed changes stay visible to the service preflights
+            mkdir -p "$GITDIR/deployed"
+            for svc in "$@"; do
+              if [ ! -f "$GITDIR/deployed/$svc" ]; then
+                git rev-parse HEAD > "$GITDIR/deployed/$svc"
+                echo "marker seeded: $svc at $(git log -1 --format=%h)"
+              fi
+            done
+            echo "before: $(git log -1 --oneline --no-decorate)"
+            git fetch --quiet origin "$BRANCH"
+            git checkout --quiet "$BRANCH"
+            git pull --quiet --ff-only origin "$BRANCH"
+            echo "after:  $(git log -1 --oneline --no-decorate)"
+          ' _ "$GITDIR" "$BRANCH" $MARKER_SERVICES
+          SCRIPT
+          { echo "### Repo pull"; echo '```'; cat pull.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check base services
         run: |
@@ -286,8 +321,8 @@ jobs:
             BASE=$(cat "$MARKER")
             echo "base: last $SVC deploy at $(git log -1 --format='%h %s' "$BASE")"
           else
-            # first run: record the current checkout as deployed state NOW, before any
-            # other service's deploy pulls the repo and moves HEAD past these changes
+            # fallback (normally seeded by the pull in base-services): record the
+            # current checkout as deployed state NOW, before HEAD can move
             BASE=$(git rev-parse HEAD)
             mkdir -p "$GITDIR/deployed"
             echo "$BASE" > "$MARKER"
@@ -417,7 +452,7 @@ jobs:
         run: *service_preflight
 
   # ===========================================================================
-  # Service deploys: MANUAL — pull repo, stop + start the service
+  # Service deploys: MANUAL — recreate the service on the already-pulled repo
   # ===========================================================================
   migrations-deploy:
     name: Migrations deploy
@@ -438,20 +473,13 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-      - name: Pull repo and recreate service
+      - name: Recreate service
         run: &service_deploy |
-          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$BRANCH" "$SVC" <<'SCRIPT'
+          ssh "$USER@$HOST" bash -s -- "$APP_DIR" "$SVC" <<'SCRIPT'
           set -e
           cd "$1"
-          BRANCH=$2; SVC=$3
+          SVC=$2
           GITDIR=$(git rev-parse --git-dir)
-          # git under a server-side lock: migrations and resources deploys can run at the same time
-          flock "$GITDIR/deploy.lock" bash -c '
-            set -e
-            git fetch --quiet origin "$1"
-            git checkout --quiet "$1"
-            git pull --quiet --ff-only origin "$1"
-          ' _ "$BRANCH"
           echo "repo at: $(git log -1 --oneline --no-decorate)"
           docker compose pull --quiet "$SVC"
           # new image and/or new mounted files -> force a fresh start
@@ -480,7 +508,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
 
-      - name: Pull repo and recreate service
+      - name: Recreate service
         run: *service_deploy
 
   # ===========================================================================
