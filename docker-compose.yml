@@ -6,7 +6,7 @@ x-logging: &default-logging
 
 services:
   frontend:
-    image: lblod/frontend-openproceshuis:1.6.5
+    image: lblod/frontend-openproceshuis:feature/deploy-workflow
     environment:
       EMBER_OAUTH_API_REDIRECT_URL: "https://openproceshuis.lblod.info/authorization/callback"
       EMBER_OAUTH_API_KEY: "aaf8877c-0975-4003-8db8-a9986355b80b"
