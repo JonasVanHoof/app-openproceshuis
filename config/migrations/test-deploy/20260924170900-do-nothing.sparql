@@ -1,0 +1,4 @@
+select *
+where {
+  ?s a ?type .
+} limit 1
