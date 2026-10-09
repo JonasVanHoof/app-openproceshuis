@@ -351,9 +351,16 @@ jobs:
           CID=$(docker compose ps -a -q "$SVC")
 
           # --- 1. image tag ---
+          # image of exactly $SVC (config --images also lists depends_on services)
+          image_of() {
+            "$@" config | awk -v s="$SVC" '
+              /^[^ ]/ { in_s = ($0 == "services:"); svc = 0; next }
+              in_s && /^  [^ ]/ { svc = ($0 == "  " s ":"); next }
+              in_s && svc && /^    image:/ { gsub(/"/, "", $2); print $2; exit }'
+          }
           image_new=false
-          IMAGE_NOW=$(docker compose config --images "$SVC")
-          IMAGE_NEXT=$("${NEXT[@]}" config --images "$SVC")
+          IMAGE_NOW=$(image_of docker compose)
+          IMAGE_NEXT=$(image_of "${NEXT[@]}")
           "${NEXT[@]}" pull --quiet "$SVC"   # downloads only, container untouched
           echo
           echo "== image =="
