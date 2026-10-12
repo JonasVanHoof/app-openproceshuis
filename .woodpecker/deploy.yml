@@ -10,7 +10,8 @@
 when:
   - event: manual
   - event: deployment
-    environment: development # button: only target "development"
+    # button: only target "development" (Woodpecker 3 has no `environment` filter)
+    evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "development"'
   - event: push
     branch: deploy-workflow
 
