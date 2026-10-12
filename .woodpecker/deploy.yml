@@ -1,10 +1,14 @@
 # Deploy (development)
 # Woodpecker pre-processes ${VAR} / $VAR in this file, so runtime shell
 # variables (secrets, step env) are escaped as $${VAR}.
-# Push to deploy-workflow = preflights only (dry run). Manual run = preflights + deploys.
+# Push to deploy-workflow = preflights only (dry run): deploy steps show, but do nothing.
+# Deploy button on a finished pipeline (event: deployment) or "Run pipeline"
+# (event: manual) = preflights + deploys of everything that changed.
+#   Optional variable DEPLOY=frontend,migrations,resource (default: all) picks services.
 
 when:
   - event: manual
+  - event: deployment
   - event: push
     branch: deploy-workflow
 
@@ -17,9 +21,6 @@ variables:
     MARKER_SERVICES: migrations resource
 
 steps:
-  # ===========================================================================
-  # SSH setup: key, known_hosts and an ssh alias `deploy` in the workspace
-  # ===========================================================================
   - name: ssh-setup
     image: alpine:3.20
     environment:
@@ -50,10 +51,6 @@ steps:
         EOF
       - ssh -F .ssh/config deploy 'echo "connected to $$(hostname)"'
 
-  # ===========================================================================
-  # Server preflight (read-only): current branch, new commits, checkout blockers.
-  # Not fatal: frontend doesn't need git. The service preflights fail on it.
-  # ===========================================================================
   - name: server-preflight
     image: alpine:3.20
     depends_on: [ssh-setup]
@@ -68,10 +65,6 @@ steps:
           echo "WARNING: checkout of $${BRANCH} not possible on the server (see blockers above)."
         fi
 
-  # ===========================================================================
-  # Base services: pull the repo (only with new commits), then check that the
-  # base services are up. The ONLY step that moves git on the server.
-  # ===========================================================================
   - name: base-services
     image: alpine:3.20
     depends_on: [server-preflight]
@@ -93,9 +86,6 @@ steps:
           exit 1
         fi
 
-  # ===========================================================================
-  # Frontend: always check (runs on :latest), deploy on manual runs
-  # ===========================================================================
   - name: frontend-preflight
     image: alpine:3.20
     depends_on: [base-services]
@@ -113,10 +103,17 @@ steps:
   - name: frontend-deploy
     image: alpine:3.20
     depends_on: [frontend-preflight]
-    when:
-      - event: manual
     environment: *deploy_env
     commands:
+      - |
+        case "$${CI_PIPELINE_EVENT}" in
+          manual|deployment) ;;
+          *) echo "Dry run ($${CI_PIPELINE_EVENT}): frontend not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
+        esac
+        case ",$${DEPLOY:-all}," in
+          *,all,*|*,frontend,*) ;;
+          *) echo "frontend not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
+        esac
       - . ./frontend.env
       - |
         if [ "$${changed}" != "true" ]; then
@@ -126,10 +123,6 @@ steps:
       - apk add --no-cache openssh-client
       - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < .woodpecker/scripts/deploy-service.sh
 
-  # ===========================================================================
-  # Repo-driven services: preflight (always) -> deploy (manual runs only)
-  # service-preflight.sh args: <APP_DIR> <BRANCH> <SERVICE> <WATCH> <DEPLOY_ON>
-  # ===========================================================================
   - name: migrations-preflight
     image: alpine:3.20
     depends_on: [base-services]
@@ -159,17 +152,23 @@ steps:
           exit 1
         fi
       - apk add --no-cache openssh-client
-      # compose service is `resource`, the folder is config/resources
       - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" resource config/resources any < .woodpecker/scripts/service-preflight.sh | tee resource.txt
       - grep '^deploy_needed=' resource.txt > resource.env
 
   - name: migrations-deploy
     image: alpine:3.20
     depends_on: [migrations-preflight]
-    when:
-      - event: manual
     environment: *deploy_env
     commands:
+      - |
+        case "$${CI_PIPELINE_EVENT}" in
+          manual|deployment) ;;
+          *) echo "Dry run ($${CI_PIPELINE_EVENT}): migrations not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
+        esac
+        case ",$${DEPLOY:-all}," in
+          *,all,*|*,migrations,*) ;;
+          *) echo "migrations not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
+        esac
       - . ./migrations.env
       - |
         if [ "$${deploy_needed}" != "true" ]; then
@@ -183,10 +182,17 @@ steps:
   - name: resource-deploy
     image: alpine:3.20
     depends_on: [resource-preflight]
-    when:
-      - event: manual
     environment: *deploy_env
     commands:
+      - |
+        case "$${CI_PIPELINE_EVENT}" in
+          manual|deployment) ;;
+          *) echo "Dry run ($${CI_PIPELINE_EVENT}): resource not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
+        esac
+        case ",$${DEPLOY:-all}," in
+          *,all,*|*,resource,*) ;;
+          *) echo "resource not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
+        esac
       - . ./resource.env
       - |
         if [ "$${deploy_needed}" != "true" ]; then
@@ -197,16 +203,11 @@ steps:
       - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" resource marker < .woodpecker/scripts/deploy-service.sh
       - touch .deployed-resource
 
-  # ===========================================================================
-  # Restart cache: once, when at least one of the two actually deployed,
-  # also if the other one failed (status: failure)
-  # ===========================================================================
   - name: restart-cache
     image: alpine:3.20
     depends_on: [migrations-deploy, resource-deploy]
     when:
-      - event: manual
-        status: [success, failure]
+      - status: [success, failure]
     environment: *deploy_env
     commands:
       - |
