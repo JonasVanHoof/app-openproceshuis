@@ -44,7 +44,7 @@ steps:
     commands:
       - set -o pipefail
       - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < .woodpecker/scripts/server-preflight.sh | tee preflight.txt
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < deploy/server-preflight.sh | tee preflight.txt
       - grep -E '^(current_branch|checkout_possible|sync_needed)=' preflight.txt > preflight.env
       - |
         if grep -q '^checkout_possible=false' preflight.txt; then
@@ -54,3 +54,37 @@ steps:
           fi
           echo "WARNING: server repo not clean, but no git sync needed. Continuing with service checks."
         fi
+
+  - name: frontend-preflight
+    image: alpine:3.20
+    depends_on: [server-preflight]
+    environment:
+      APP_DIR:
+        from_secret: deploy_app_dir
+    commands:
+      - set -o pipefail
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" < deploy/frontend-preflight.sh | tee frontend.txt
+      - grep '^changed=' frontend.txt > frontend.env
+      - |
+        if grep -q '^changed=false' frontend.env; then
+          echo "NOTICE: frontend up to date, running container already uses the latest image."
+        fi
+
+  - name: frontend-deploy
+    image: alpine:3.20
+    depends_on: [frontend-preflight]
+    when:
+      - event: manual
+    environment:
+      APP_DIR:
+        from_secret: deploy_app_dir
+    commands:
+      - . ./frontend.env
+      - |
+        if [ "$${changed}" != "true" ]; then
+          echo "Frontend unchanged, nothing to deploy."
+          exit 0
+        fi
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < deploy/deploy-service.sh
