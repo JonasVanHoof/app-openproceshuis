@@ -1,0 +1,56 @@
+when:
+  - event: manual
+  - event: push
+    branch: deploy-workflow
+
+steps:
+  - name: ssh-setup
+    image: alpine:3.20
+    environment:
+      DEPLOY_SSH_KEY:
+        from_secret: deploy_ssh_key
+      DEPLOY_KNOWN_HOSTS:
+        from_secret: deploy_known_hosts
+      DEPLOY_HOST:
+        from_secret: deploy_host
+      DEPLOY_USER:
+        from_secret: deploy_user
+    commands:
+      - apk add --no-cache openssh-client
+      - mkdir -p .ssh && chmod 700 .ssh
+      - printf '%s\n' "$${DEPLOY_SSH_KEY}" > .ssh/id_ed25519
+      - printf '%s\n' "$${DEPLOY_KNOWN_HOSTS}" > .ssh/known_hosts
+      - chmod 600 .ssh/id_ed25519 .ssh/known_hosts
+      - |
+        cat > .ssh/config <<EOF
+        Host deploy
+          HostName $${DEPLOY_HOST}
+          User $${DEPLOY_USER}
+          IdentityFile $${CI_WORKSPACE}/.ssh/id_ed25519
+          IdentitiesOnly yes
+          UserKnownHostsFile $${CI_WORKSPACE}/.ssh/known_hosts
+          StrictHostKeyChecking yes
+          BatchMode yes
+        EOF
+      - ssh -F .ssh/config deploy 'echo "connected to $$(hostname)"'
+
+  - name: server-preflight
+    image: alpine:3.20
+    depends_on: [ssh-setup]
+    environment:
+      APP_DIR:
+        from_secret: deploy_app_dir
+      BRANCH: development
+    commands:
+      - set -o pipefail
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < .woodpecker/scripts/server-preflight.sh | tee preflight.txt
+      - grep -E '^(current_branch|checkout_possible|sync_needed)=' preflight.txt > preflight.env
+      - |
+        if grep -q '^checkout_possible=false' preflight.txt; then
+          if grep -q '^sync_needed=true' preflight.txt; then
+            echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see blockers above)"
+            exit 1
+          fi
+          echo "WARNING: server repo not clean, but no git sync needed. Continuing with service checks."
+        fi
