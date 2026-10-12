@@ -1,19 +1,21 @@
 # Deploy (development)
-# Woodpecker pre-processes ${VAR} / $VAR in this file, so runtime shell
-# variables (secrets, step env) are escaped as $${VAR}.
-# Push to deploy-workflow = preflights only (dry run): deploy steps show, but do nothing.
-# Deploy button on a finished pipeline (event: deployment) or "Run pipeline"
-# (event: manual) = preflights + deploys of everything that changed.
-#   Optional variable DEPLOY=frontend,migrations,resource (default: all) picks services.
+# Every step is one call to .woodpecker/scripts/ci.sh, so the UI shows one command
+# per step. The logic lives in ci.sh, the work on the server in the other scripts.
+#
+# Push to deploy-workflow = preflights only: nothing is restarted.
+# Button on a finished pipeline (target: development) or "Run pipeline"
+# = preflights + rollout of everything that changed.
+#   Optional variable SERVICES=frontend,migrations,resource (default: all).
 
 when:
   - event: manual
   - event: deployment
+    environment: development # button: only target "development"
   - event: push
     branch: deploy-workflow
 
 variables:
-  - &deploy_env
+  - &env
     APP_DIR:
       from_secret: deploy_app_dir
     BRANCH: deploy-workflow
@@ -33,187 +35,73 @@ steps:
       DEPLOY_USER:
         from_secret: deploy_user
     commands:
-      - apk add --no-cache openssh-client
-      - mkdir -p .ssh && chmod 700 .ssh
-      - printf '%s\n' "$${DEPLOY_SSH_KEY}" > .ssh/id_ed25519
-      - printf '%s\n' "$${DEPLOY_KNOWN_HOSTS}" > .ssh/known_hosts
-      - chmod 600 .ssh/id_ed25519 .ssh/known_hosts
-      - |
-        cat > .ssh/config <<EOF
-        Host deploy
-          HostName $${DEPLOY_HOST}
-          User $${DEPLOY_USER}
-          IdentityFile $${CI_WORKSPACE}/.ssh/id_ed25519
-          IdentitiesOnly yes
-          UserKnownHostsFile $${CI_WORKSPACE}/.ssh/known_hosts
-          StrictHostKeyChecking yes
-          BatchMode yes
-        EOF
-      - ssh -F .ssh/config deploy 'echo "connected to $$(hostname)"'
+      - sh .woodpecker/scripts/ci.sh ssh-setup
 
+  # read-only; not fatal: frontend doesn't need git, service preflights fail on it
   - name: server-preflight
     image: alpine:3.20
     depends_on: [ssh-setup]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - set -o pipefail
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < .woodpecker/scripts/server-preflight.sh | tee preflight.txt
-      - grep -E '^(current_branch|checkout_possible|sync_needed)=' preflight.txt > preflight.env
-      - |
-        if grep -q '^checkout_possible=false' preflight.txt; then
-          echo "WARNING: checkout of $${BRANCH} not possible on the server (see blockers above)."
-        fi
+      - sh .woodpecker/scripts/ci.sh server-preflight
 
+  # the ONLY step that moves git on the server, then checks base services are up
   - name: base-services
     image: alpine:3.20
     depends_on: [server-preflight]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - set -o pipefail
-      - apk add --no-cache openssh-client
-      - . ./preflight.env
-      - |
-        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" = true ]; then
-          ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" $${MARKER_SERVICES} < .woodpecker/scripts/repo-pull.sh
-        else
-          echo "Repo pull skipped (sync_needed=$${sync_needed}, checkout_possible=$${checkout_possible})."
-        fi
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" $${BASE_SERVICES} < .woodpecker/scripts/base-services.sh | tee base.txt
-      - |
-        if ! grep -q '^base_ok=true' base.txt; then
-          echo "ERROR: one or more base services are not running/healthy (see table above)."
-          exit 1
-        fi
+      - sh .woodpecker/scripts/ci.sh base-services
 
   - name: frontend-preflight
     image: alpine:3.20
     depends_on: [base-services]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - set -o pipefail
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" < .woodpecker/scripts/frontend-preflight.sh | tee frontend.txt
-      - grep '^changed=' frontend.txt > frontend.env
-      - |
-        if grep -q '^changed=false' frontend.env; then
-          echo "NOTICE: frontend up to date, running container already uses the latest image."
-        fi
-
-  - name: frontend-deploy
-    image: alpine:3.20
-    depends_on: [frontend-preflight]
-    environment: *deploy_env
-    commands:
-      - |
-        case "$${CI_PIPELINE_EVENT}" in
-          manual|deployment) ;;
-          *) echo "Dry run ($${CI_PIPELINE_EVENT}): frontend not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
-        esac
-        case ",$${DEPLOY:-all}," in
-          *,all,*|*,frontend,*) ;;
-          *) echo "frontend not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
-        esac
-      - . ./frontend.env
-      - |
-        if [ "$${changed}" != "true" ]; then
-          echo "Frontend unchanged, nothing to deploy."
-          exit 0
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < .woodpecker/scripts/deploy-service.sh
+      - sh .woodpecker/scripts/ci.sh frontend-preflight
 
   - name: migrations-preflight
     image: alpine:3.20
     depends_on: [base-services]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - set -o pipefail
-      - . ./preflight.env
-      - |
-        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" != true ]; then
-          echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see server-preflight)."
-          exit 1
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" migrations config/migrations added < .woodpecker/scripts/service-preflight.sh | tee migrations.txt
-      - grep '^deploy_needed=' migrations.txt > migrations.env
+      - sh .woodpecker/scripts/ci.sh service-preflight migrations config/migrations added
 
+  # compose service is `resource`, the folder is config/resources
   - name: resource-preflight
     image: alpine:3.20
     depends_on: [base-services]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - set -o pipefail
-      - . ./preflight.env
-      - |
-        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" != true ]; then
-          echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see server-preflight)."
-          exit 1
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" resource config/resources any < .woodpecker/scripts/service-preflight.sh | tee resource.txt
-      - grep '^deploy_needed=' resource.txt > resource.env
+      - sh .woodpecker/scripts/ci.sh service-preflight resource config/resources any
+
+  - name: frontend-deploy
+    image: alpine:3.20
+    depends_on: [frontend-preflight]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh release frontend
 
   - name: migrations-deploy
     image: alpine:3.20
     depends_on: [migrations-preflight]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - |
-        case "$${CI_PIPELINE_EVENT}" in
-          manual|deployment) ;;
-          *) echo "Dry run ($${CI_PIPELINE_EVENT}): migrations not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
-        esac
-        case ",$${DEPLOY:-all}," in
-          *,all,*|*,migrations,*) ;;
-          *) echo "migrations not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
-        esac
-      - . ./migrations.env
-      - |
-        if [ "$${deploy_needed}" != "true" ]; then
-          echo "Migrations: nothing to deploy."
-          exit 0
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" migrations marker < .woodpecker/scripts/deploy-service.sh
-      - touch .deployed-migrations
+      - sh .woodpecker/scripts/ci.sh release migrations marker
 
   - name: resource-deploy
     image: alpine:3.20
     depends_on: [resource-preflight]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - |
-        case "$${CI_PIPELINE_EVENT}" in
-          manual|deployment) ;;
-          *) echo "Dry run ($${CI_PIPELINE_EVENT}): resource not deployed. Use 'Deploy' on this pipeline to deploy."; exit 0 ;;
-        esac
-        case ",$${DEPLOY:-all}," in
-          *,all,*|*,resource,*) ;;
-          *) echo "resource not selected (DEPLOY=$${DEPLOY}), skipped."; exit 0 ;;
-        esac
-      - . ./resource.env
-      - |
-        if [ "$${deploy_needed}" != "true" ]; then
-          echo "Resource: nothing to deploy."
-          exit 0
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" resource marker < .woodpecker/scripts/deploy-service.sh
-      - touch .deployed-resource
+      - sh .woodpecker/scripts/ci.sh release resource marker
 
+  # once, when migrations and/or resource rolled out; also if the other one failed
   - name: restart-cache
     image: alpine:3.20
     depends_on: [migrations-deploy, resource-deploy]
     when:
       - status: [success, failure]
-    environment: *deploy_env
+    environment: *env
     commands:
-      - |
-        if [ ! -e .deployed-migrations ] && [ ! -e .deployed-resource ]; then
-          echo "No migrations or resource deploy, cache untouched."
-          exit 0
-        fi
-      - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy "cd '$${APP_DIR}' && docker compose restart cache && docker compose ps cache"
+      - sh .woodpecker/scripts/ci.sh restart-cache

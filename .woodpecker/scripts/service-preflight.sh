@@ -7,7 +7,7 @@
 # Compares origin/BRANCH with the commit this service was LAST DEPLOYED at
 # (.git/deployed/<SERVICE>), not HEAD: another service's deploy may have moved HEAD.
 # Only side effects: image pull, temp files, and creating a missing marker (fallback).
-# Prints a deploy_needed=true|false line (and optionally warning=...).
+# Prints a changed=true|false line (and optionally warning=...).
 set -e
 cd "$1"
 BRANCH=$2; SVC=$3; WATCH=$4; DEPLOY_ON=$5
@@ -19,14 +19,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 if [ -f "$MARKER" ]; then
   BASE=$(cat "$MARKER")
-  echo "base: last $SVC deploy at $(git log -1 --format='%h %s' "$BASE")"
+  echo "base: last $SVC rollout at $(git log -1 --format='%h %s' "$BASE")"
 else
   # fallback (normally seeded by repo-pull.sh): record the current checkout
   # as deployed state NOW, before HEAD can move
   BASE=$(git rev-parse HEAD)
   mkdir -p "$GITDIR/deployed"
   echo "$BASE" > "$MARKER"
-  echo "base: current checkout $(git log -1 --format='%h %s' "$BASE") (no $SVC deploy recorded yet, marker created)"
+  echo "base: current checkout $(git log -1 --format='%h %s' "$BASE") (no $SVC rollout recorded yet, marker created)"
 fi
 echo "target: $TARGET at $(git log -1 --format='%h %s' "$TARGET")"
 
@@ -113,7 +113,7 @@ case "$DEPLOY_ON" in
   *)     echo "unknown DEPLOY_ON '$DEPLOY_ON' (use added|any)" >&2; exit 1 ;;
 esac
 echo
-echo "deploy_needed=$deploy"
+echo "changed=$deploy"
 if [ "$DEPLOY_ON" = added ] && [ -n "$changed" ]; then
   echo "warning=existing files changed/removed; already-run migrations are NOT re-run"
 fi
