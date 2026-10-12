@@ -44,7 +44,7 @@ steps:
     commands:
       - set -o pipefail
       - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < deploy/server-preflight.sh | tee preflight.txt
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" < .woodpecker/scripts/server-preflight.sh | tee preflight.txt
       - grep -E '^(current_branch|checkout_possible|sync_needed)=' preflight.txt > preflight.env
       - |
         if grep -q '^checkout_possible=false' preflight.txt; then
@@ -64,7 +64,7 @@ steps:
     commands:
       - set -o pipefail
       - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" < deploy/frontend-preflight.sh | tee frontend.txt
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" < .woodpecker/scripts/frontend-preflight.sh | tee frontend.txt
       - grep '^changed=' frontend.txt > frontend.env
       - |
         if grep -q '^changed=false' frontend.env; then
@@ -87,4 +87,4 @@ steps:
           exit 0
         fi
       - apk add --no-cache openssh-client
-      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < deploy/deploy-service.sh
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < .woodpecker/scripts/deploy-service.sh
