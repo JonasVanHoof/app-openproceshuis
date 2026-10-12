@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs ON the server. Pulls the frontend image (download only, the running
 # container is not touched) and compares it with the running container.
-#   ssh deploy bash -s -- <APP_DIR> < deploy/frontend-preflight.sh
+#   ssh deploy bash -s -- <APP_DIR> < .woodpecker/scripts/frontend-preflight.sh
 # Prints key=value lines: image, changed=true|false, reason
 set -e
 cd "$1"

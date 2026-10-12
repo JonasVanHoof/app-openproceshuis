@@ -1,9 +1,25 @@
+# Deploy (development)
+# Woodpecker pre-processes ${VAR} / $VAR in this file, so runtime shell
+# variables (secrets, step env) are escaped as $${VAR}.
+# Push to deploy-workflow = preflights only (dry run). Manual run = preflights + deploys.
+
 when:
   - event: manual
   - event: push
     branch: deploy-workflow
 
+variables:
+  - &deploy_env
+    APP_DIR:
+      from_secret: deploy_app_dir
+    BRANCH: deploy-workflow
+    BASE_SERVICES: virtuoso database
+    MARKER_SERVICES: migrations resource
+
 steps:
+  # ===========================================================================
+  # SSH setup: key, known_hosts and an ssh alias `deploy` in the workspace
+  # ===========================================================================
   - name: ssh-setup
     image: alpine:3.20
     environment:
@@ -34,13 +50,14 @@ steps:
         EOF
       - ssh -F .ssh/config deploy 'echo "connected to $$(hostname)"'
 
+  # ===========================================================================
+  # Server preflight (read-only): current branch, new commits, checkout blockers.
+  # Not fatal: frontend doesn't need git. The service preflights fail on it.
+  # ===========================================================================
   - name: server-preflight
     image: alpine:3.20
     depends_on: [ssh-setup]
-    environment:
-      APP_DIR:
-        from_secret: deploy_app_dir
-      BRANCH: development
+    environment: *deploy_env
     commands:
       - set -o pipefail
       - apk add --no-cache openssh-client
@@ -48,19 +65,41 @@ steps:
       - grep -E '^(current_branch|checkout_possible|sync_needed)=' preflight.txt > preflight.env
       - |
         if grep -q '^checkout_possible=false' preflight.txt; then
-          if grep -q '^sync_needed=true' preflight.txt; then
-            echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see blockers above)"
-            exit 1
-          fi
-          echo "WARNING: server repo not clean, but no git sync needed. Continuing with service checks."
+          echo "WARNING: checkout of $${BRANCH} not possible on the server (see blockers above)."
         fi
 
-  - name: frontend-preflight
+  # ===========================================================================
+  # Base services: pull the repo (only with new commits), then check that the
+  # base services are up. The ONLY step that moves git on the server.
+  # ===========================================================================
+  - name: base-services
     image: alpine:3.20
     depends_on: [server-preflight]
-    environment:
-      APP_DIR:
-        from_secret: deploy_app_dir
+    environment: *deploy_env
+    commands:
+      - set -o pipefail
+      - apk add --no-cache openssh-client
+      - . ./preflight.env
+      - |
+        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" = true ]; then
+          ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" $${MARKER_SERVICES} < .woodpecker/scripts/repo-pull.sh
+        else
+          echo "Repo pull skipped (sync_needed=$${sync_needed}, checkout_possible=$${checkout_possible})."
+        fi
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" $${BASE_SERVICES} < .woodpecker/scripts/base-services.sh | tee base.txt
+      - |
+        if ! grep -q '^base_ok=true' base.txt; then
+          echo "ERROR: one or more base services are not running/healthy (see table above)."
+          exit 1
+        fi
+
+  # ===========================================================================
+  # Frontend: always check (runs on :latest), deploy on manual runs
+  # ===========================================================================
+  - name: frontend-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *deploy_env
     commands:
       - set -o pipefail
       - apk add --no-cache openssh-client
@@ -76,9 +115,7 @@ steps:
     depends_on: [frontend-preflight]
     when:
       - event: manual
-    environment:
-      APP_DIR:
-        from_secret: deploy_app_dir
+    environment: *deploy_env
     commands:
       - . ./frontend.env
       - |
@@ -88,3 +125,94 @@ steps:
         fi
       - apk add --no-cache openssh-client
       - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" frontend < .woodpecker/scripts/deploy-service.sh
+
+  # ===========================================================================
+  # Repo-driven services: preflight (always) -> deploy (manual runs only)
+  # service-preflight.sh args: <APP_DIR> <BRANCH> <SERVICE> <WATCH> <DEPLOY_ON>
+  # ===========================================================================
+  - name: migrations-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *deploy_env
+    commands:
+      - set -o pipefail
+      - . ./preflight.env
+      - |
+        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" != true ]; then
+          echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see server-preflight)."
+          exit 1
+        fi
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" migrations config/migrations added < .woodpecker/scripts/service-preflight.sh | tee migrations.txt
+      - grep '^deploy_needed=' migrations.txt > migrations.env
+
+  - name: resource-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *deploy_env
+    commands:
+      - set -o pipefail
+      - . ./preflight.env
+      - |
+        if [ "$${sync_needed}" = true ] && [ "$${checkout_possible}" != true ]; then
+          echo "ERROR: cannot switch to $${BRANCH} on the server, manual intervention needed (see server-preflight)."
+          exit 1
+        fi
+      - apk add --no-cache openssh-client
+      # compose service is `resource`, the folder is config/resources
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" "$${BRANCH}" resource config/resources any < .woodpecker/scripts/service-preflight.sh | tee resource.txt
+      - grep '^deploy_needed=' resource.txt > resource.env
+
+  - name: migrations-deploy
+    image: alpine:3.20
+    depends_on: [migrations-preflight]
+    when:
+      - event: manual
+    environment: *deploy_env
+    commands:
+      - . ./migrations.env
+      - |
+        if [ "$${deploy_needed}" != "true" ]; then
+          echo "Migrations: nothing to deploy."
+          exit 0
+        fi
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" migrations marker < .woodpecker/scripts/deploy-service.sh
+      - touch .deployed-migrations
+
+  - name: resource-deploy
+    image: alpine:3.20
+    depends_on: [resource-preflight]
+    when:
+      - event: manual
+    environment: *deploy_env
+    commands:
+      - . ./resource.env
+      - |
+        if [ "$${deploy_needed}" != "true" ]; then
+          echo "Resource: nothing to deploy."
+          exit 0
+        fi
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy bash -s -- "$${APP_DIR}" resource marker < .woodpecker/scripts/deploy-service.sh
+      - touch .deployed-resource
+
+  # ===========================================================================
+  # Restart cache: once, when at least one of the two actually deployed,
+  # also if the other one failed (status: failure)
+  # ===========================================================================
+  - name: restart-cache
+    image: alpine:3.20
+    depends_on: [migrations-deploy, resource-deploy]
+    when:
+      - event: manual
+        status: [success, failure]
+    environment: *deploy_env
+    commands:
+      - |
+        if [ ! -e .deployed-migrations ] && [ ! -e .deployed-resource ]; then
+          echo "No migrations or resource deploy, cache untouched."
+          exit 0
+        fi
+      - apk add --no-cache openssh-client
+      - ssh -F .ssh/config deploy "cd '$${APP_DIR}' && docker compose restart cache && docker compose ps cache"

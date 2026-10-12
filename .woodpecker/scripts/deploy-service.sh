@@ -1,35 +1,26 @@
 #!/usr/bin/env bash
-# Runs ON the server. Recreates one compose service.
-#   ssh deploy bash -s -- <APP_DIR> <SERVICE> [BRANCH] < deploy/deploy-service.sh
+# Runs ON the server. Recreates one compose service on the already-pulled repo.
+#   ssh deploy bash -s -- <APP_DIR> <SERVICE> [marker] < .woodpecker/scripts/deploy-service.sh
 #
-# Without BRANCH (frontend): uses the image the preflight already pulled, so it
-#   deploys exactly what was checked. Repo is not touched.
-# With BRANCH (migrations, resource): syncs the repo to origin/BRANCH, pulls the
-#   image, recreates, and records the deployed commit in .git/deployed/<SERVICE>.
+# Without "marker" (frontend): uses the image the preflight already pulled, so it
+#   deploys exactly what was checked.
+# With "marker" (migrations, resource): pulls the image, force-recreates (new
+#   mounted files don't change the compose config), and records the deployed
+#   commit in .git/deployed/<SERVICE> for the service preflight.
 set -e
 cd "$1"
 SVC=$2
-BRANCH=${3:-}
-GITDIR=$(git rev-parse --git-dir)
+MODE=${3:-}
 
-if [ -n "$BRANCH" ]; then
-  # git under a server-side lock: service deploys can run at the same time
-  flock "$GITDIR/deploy.lock" bash -c '
-    set -e
-    git fetch --quiet origin "$1"
-    git checkout --quiet "$1"
-    git pull --quiet --ff-only origin "$1"
-  ' _ "$BRANCH"
+if [ "$MODE" = marker ]; then
+  GITDIR=$(git rev-parse --git-dir)
   echo "repo at: $(git log -1 --oneline --no-decorate)"
   docker compose pull --quiet "$SVC"
-fi
-
-# new image and/or new mounted files -> force a fresh start
-docker compose up -d --no-deps --force-recreate "$SVC"
-
-if [ -n "$BRANCH" ]; then
+  docker compose up -d --no-deps --force-recreate "$SVC"
   mkdir -p "$GITDIR/deployed"
   git rev-parse HEAD > "$GITDIR/deployed/$SVC"
+else
+  docker compose up -d --no-deps "$SVC"
 fi
 
 docker compose ps "$SVC"
