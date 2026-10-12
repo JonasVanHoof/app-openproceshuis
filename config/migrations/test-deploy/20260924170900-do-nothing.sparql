@@ -1,4 +1,4 @@
 select *
 where {
   ?s a ?type .
-} limit 1
+} limit 2
