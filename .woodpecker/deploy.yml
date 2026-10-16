@@ -1,0 +1,108 @@
+# Deploy (development)
+# Every step is one call to .woodpecker/scripts/ci.sh, so the UI shows one command
+# per step. The logic lives in ci.sh, the work on the server in the other scripts.
+#
+# Push to deploy-workflow = preflights only: nothing is restarted.
+# Button on a finished pipeline (target: development) or "Run pipeline"
+# = preflights + rollout of everything that changed.
+#   Optional variable SERVICES=frontend,migrations,resource (default: all).
+
+when:
+  - event: manual
+  - event: deployment
+    # button: only target "development" (Woodpecker 3 has no `environment` filter)
+    evaluate: 'CI_PIPELINE_DEPLOY_TARGET == "development"'
+  - event: push
+    branch: deploy-workflow
+
+variables:
+  - &env
+    APP_DIR:
+      from_secret: deploy_app_dir
+    BRANCH: deploy-workflow
+    BASE_SERVICES: virtuoso database
+    MARKER_SERVICES: migrations resource
+
+steps:
+  - name: ssh-setup
+    image: alpine:3.20
+    environment:
+      DEPLOY_SSH_KEY:
+        from_secret: deploy_ssh_key
+      DEPLOY_KNOWN_HOSTS:
+        from_secret: deploy_known_hosts
+      DEPLOY_HOST:
+        from_secret: deploy_host
+      DEPLOY_USER:
+        from_secret: deploy_user
+    commands:
+      - sh .woodpecker/scripts/ci.sh ssh-setup
+
+  # read-only; not fatal: frontend doesn't need git, service preflights fail on it
+  - name: server-preflight
+    image: alpine:3.20
+    depends_on: [ssh-setup]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh server-preflight
+
+  # the ONLY step that moves git on the server, then checks base services are up
+  - name: base-services
+    image: alpine:3.20
+    depends_on: [server-preflight]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh base-services
+
+  - name: frontend-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh frontend-preflight
+
+  - name: migrations-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh service-preflight migrations config/migrations added
+
+  # compose service is `resource`, the folder is config/resources
+  - name: resource-preflight
+    image: alpine:3.20
+    depends_on: [base-services]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh service-preflight resource config/resources any
+
+  - name: frontend-deploy
+    image: alpine:3.20
+    depends_on: [frontend-preflight]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh release frontend
+
+  - name: migrations-deploy
+    image: alpine:3.20
+    depends_on: [migrations-preflight]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh release migrations marker
+
+  - name: resource-deploy
+    image: alpine:3.20
+    depends_on: [resource-preflight]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh release resource marker
+
+  # once, when migrations and/or resource rolled out; also if the other one failed
+  - name: restart-cache
+    image: alpine:3.20
+    depends_on: [migrations-deploy, resource-deploy]
+    when:
+      - status: [success, failure]
+    environment: *env
+    commands:
+      - sh .woodpecker/scripts/ci.sh restart-cache
